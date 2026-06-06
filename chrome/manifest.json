@@ -6,7 +6,8 @@
   "content_scripts": [
     {
       "matches": ["https://bsky.app/*"],
-      "js": ["dist/content.js"]
+      "js": ["dist/content.js"],
+      "world": "MAIN"
     }
   ]
 }

@@ -10,6 +10,31 @@ async function getDid(handle) {
 function getCdnUrl(did, blobRef, format) {
     return `https://cdn.bsky.app/img/${format}/plain/${did}/${blobRef.ref.$link}@${blobRef.mimeType.split('/')[1] || 'jpeg'}`;
 }
+function getVideoPlaylistUrl(did, cid) {
+    return `https://video.bsky.app/watch/${encodeURIComponent(did)}/${cid}/playlist.m3u8`;
+}
+function getVideoThumbnailUrl(did, cid) {
+    return `https://video.bsky.app/watch/${encodeURIComponent(did)}/${cid}/thumbnail.jpg`;
+}
+// Dynamically load hls.js from CDN (only loaded once, on first use)
+let hlsPromise = null;
+function loadHlsJs() {
+    if (hlsPromise)
+        return hlsPromise;
+    hlsPromise = new Promise((resolve, reject) => {
+        // If already loaded by the page, use that
+        if (window.Hls) {
+            resolve(window.Hls);
+            return;
+        }
+        const script = document.createElement("script");
+        script.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js";
+        script.onload = () => resolve(window.Hls);
+        script.onerror = () => reject(new Error("Failed to load hls.js"));
+        document.head.appendChild(script);
+    });
+    return hlsPromise;
+}
 async function getPostContent(uri) {
     try {
         const [repo, collection, rkey] = uri.split("/").slice(-3);
@@ -23,17 +48,46 @@ async function getPostContent(uri) {
         return null;
     }
 }
-async function getHandleFromDid(did) {
-    try {
-        const response = await fetch(`https://bsky.social/xrpc/com.atproto.repo.describeRepo?repo=${did}`);
-        if (!response.ok)
-            return null;
-        const { handle } = await response.json();
-        return handle;
+// Batch-fetch profiles to get handles AND avatar URLs for multiple DIDs
+async function getProfiles(dids) {
+    const profiles = new Map();
+    const uniqueDids = [...new Set(dids)];
+    if (uniqueDids.length === 0)
+        return profiles;
+    // Batch in groups of 25 (API max)
+    for (let i = 0; i < uniqueDids.length; i += 25) {
+        const batch = uniqueDids.slice(i, i + 25);
+        try {
+            const params = batch.map((d) => `actors=${encodeURIComponent(d)}`).join("&");
+            const response = await fetch(`https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles?${params}`);
+            if (!response.ok)
+                continue;
+            const data = await response.json();
+            for (const p of data.profiles || []) {
+                let avatarUrl;
+                if (p.avatar) {
+                    // Public API returns avatar as a full CDN URL string;
+                    // PDS API returns it as a blob ref object with ref.$link
+                    if (typeof p.avatar === 'string') {
+                        avatarUrl = p.avatar;
+                    }
+                    else if (p.avatar.ref?.$link) {
+                        avatarUrl = `https://cdn.bsky.app/img/avatar/plain/${p.did}/${p.avatar.ref.$link}@jpeg`;
+                    }
+                }
+                profiles.set(p.did, {
+                    did: p.did,
+                    handle: p.handle,
+                    avatarUrl,
+                    displayName: p.displayName,
+                });
+            }
+        }
+        catch {
+            // skip failed batches
+        }
     }
-    catch {
-        return null;
-    }
+    return profiles;
 }
 // ── Likes feed (tab content) ────────────────────────────────────────────────
 let activeLikesContainer = null;
@@ -91,27 +145,30 @@ async function fetchAndRenderLikes(handle) {
             ...like,
             postContent: await getPostContent(like.value.subject.uri),
         })));
-        // Resolve handles for all liked post authors
-        const handles = new Map();
-        await Promise.all(likes.map(async (like) => {
-            const [, , author] = like.value.subject.uri.split("/");
-            if (!handles.has(author)) {
-                const handle = await getHandleFromDid(author);
-                if (handle)
-                    handles.set(author, handle);
-            }
-        }));
+        // Collect unique author DIDs and batch-fetch their profiles (handles + avatars)
+        const authorDids = [...new Set(likes.map((like) => {
+                const [, , author] = like.value.subject.uri.split("/");
+                return author;
+            }))];
+        const profiles = await getProfiles(authorDids);
         // Build feed items
         const feedHtml = likes
             .map((like) => {
             const [, , author] = like.value.subject.uri.split("/");
             const postId = like.value.subject.uri.split("/").pop();
-            const handle = handles.get(author) || author;
-            const postUrl = `https://bsky.app/profile/${handle}/post/${postId}`;
+            const profile = profiles.get(author);
+            const authorHandle = profile?.handle || author;
+            const avatarUrl = profile?.avatarUrl;
+            const postUrl = `https://bsky.app/profile/${authorHandle}/post/${postId}`;
             const text = like.postContent?.text || "";
             const embedAny = like.postContent?.embed;
             const isImages = embedAny?.$type === 'app.bsky.embed.images' || embedAny?.media?.$type === 'app.bsky.embed.images';
             const isVideo = embedAny?.$type === 'app.bsky.embed.video' || embedAny?.media?.$type === 'app.bsky.embed.video';
+            // Avatar: show image if we have one, otherwise fall back to letter circle
+            const initial = authorHandle.charAt(0).toUpperCase();
+            const avatarHtml = avatarUrl
+                ? `<img src="${avatarUrl}" alt="${initial}" style="width:100%; height:100%; border-radius:50%; object-fit:cover;" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" loading="lazy"><div style="display:none; width:100%; height:100%; align-items:center; justify-content:center; color:rgb(171,184,201); font-size:14px; font-weight:600; position:absolute; top:0; left:0;">${initial}</div>`
+                : initial;
             let mediaHtml = '';
             if (isImages) {
                 const imagesList = (embedAny?.images || embedAny?.media?.images || []);
@@ -131,15 +188,16 @@ async function fetchAndRenderLikes(handle) {
             else if (isVideo) {
                 const videoBlob = embedAny?.video;
                 if (videoBlob) {
-                    const videoUrl = getCdnUrl(author, videoBlob, 'feed_fullsize');
-                    const posterUrl = getCdnUrl(author, videoBlob, 'feed_thumbnail');
+                    const cid = videoBlob.ref.$link;
+                    const playlistUrl = getVideoPlaylistUrl(author, cid);
+                    const posterUrl = getVideoThumbnailUrl(author, cid);
                     const ratio = embedAny?.aspectRatio || { width: 16, height: 9 };
                     const aspectPercent = ((ratio.height / ratio.width) * 100).toFixed(2);
+                    // Use a unique ID so we can target the video element for HLS init
+                    const videoId = `bsky-video-${postId}`;
                     mediaHtml = `<div style="position:relative; width:100%; margin-top:8px; border-radius:12px; overflow:hidden;" onclick="event.stopPropagation();">
               <div style="position:relative; width:100%; padding-bottom:${aspectPercent}%;">
-                <video poster="${posterUrl}" controls style="position:absolute; top:0; left:0; width:100%; height:100%; border-radius:12px;" onclick="event.stopPropagation();">
-                  <source src="${videoUrl}" type="${videoBlob.mimeType}">
-                </video>
+                <video id="${videoId}" poster="${posterUrl}" controls playsinline style="position:absolute; top:0; left:0; width:100%; height:100%; border-radius:12px;" onclick="event.stopPropagation();" data-hls-url="${playlistUrl}"></video>
               </div>
             </div>`;
                 }
@@ -159,14 +217,10 @@ async function fetchAndRenderLikes(handle) {
                 border-radius: 50%;
                 background: rgb(46,55,67);
                 flex-shrink: 0;
-                display: flex; align-items: center; justify-content: center;
-                color: rgb(171,184,201);
-                font-size: 14px;
-                font-weight: 600;
-                font-family: InterVariable, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                position: relative;
                 overflow: hidden;
               ">
-                ${handle.charAt(0).toUpperCase()}
+                ${avatarHtml}
               </div>
               <div style="flex:1; min-width:0;">
                 <div style="display:flex; align-items:baseline; gap:4px; margin-bottom:4px;">
@@ -176,7 +230,7 @@ async function fetchAndRenderLikes(handle) {
                     font-size: 15px;
                     font-family: InterVariable, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-                  ">@${handle}</span>
+                  ">@${authorHandle}</span>
                   <span style="
                     color: rgb(139,148,164);
                     font-size: 13px;
@@ -216,6 +270,8 @@ async function fetchAndRenderLikes(handle) {
         ${feedHtml}
       </div>
     `;
+        // Initialize HLS for all video elements after they're in the DOM
+        initVideoPlayers(likesContainer);
     }
     catch (error) {
         likesContainer.innerHTML = `
@@ -235,6 +291,35 @@ function removeLikesContainer() {
     if (container) {
         container.remove();
         activeLikesContainer = null;
+    }
+}
+// Initialize HLS.js on all video elements that have a data-hls-url attribute
+async function initVideoPlayers(container) {
+    const videos = container.querySelectorAll("video[data-hls-url]");
+    if (videos.length === 0)
+        return;
+    try {
+        const Hls = await loadHlsJs();
+        videos.forEach((video) => {
+            const hlsUrl = video.getAttribute("data-hls-url");
+            if (!hlsUrl)
+                return;
+            if (Hls.isSupported()) {
+                const hls = new Hls();
+                hls.loadSource(hlsUrl);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    // Video is ready to play
+                });
+            }
+            else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+                // Safari native HLS support
+                video.src = hlsUrl;
+            }
+        });
+    }
+    catch {
+        // hls.js failed to load - videos will show poster only
     }
 }
 // ── Likes tab injection into profile pager ──────────────────────────────────
