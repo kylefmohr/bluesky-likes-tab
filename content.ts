@@ -4,6 +4,31 @@ interface Author {
   displayName?: string;
 }
 
+interface BlobRef {
+  $type: string;
+  ref: { $link: string };
+  mimeType: string;
+  size: number;
+}
+
+interface EmbedImages {
+  $type: string;
+  images: { alt: string; image: BlobRef; aspectRatio?: { width: number; height: number } }[];
+}
+
+interface EmbedVideo {
+  $type: string;
+  video: BlobRef;
+  aspectRatio?: { width: number; height: number };
+  alt?: string;
+}
+
+interface PostContent {
+  text: string;
+  author: Author;
+  embed?: EmbedImages | EmbedVideo | { media: EmbedImages };
+}
+
 interface LikeRecord {
   value: {
     subject: {
@@ -11,16 +36,7 @@ interface LikeRecord {
     };
     createdAt: string;
   };
-  postContent?: {
-    text: string;
-    author: Author;
-    embed?: {
-      images?: any[];
-      media?: {
-        images?: any[];
-      };
-    };
-  };
+  postContent?: PostContent;
 }
 
 // ── API helpers ──────────────────────────────────────────────────────────────
@@ -34,7 +50,11 @@ async function getDid(handle: string): Promise<string> {
   return did;
 }
 
-async function getPostContent(uri: string): Promise<LikeRecord["postContent"] | null> {
+function getCdnUrl(did: string, blobRef: BlobRef, format: string): string {
+  return `https://cdn.bsky.app/img/${format}/plain/${did}/${blobRef.ref.$link}@${blobRef.mimeType.split('/')[1] || 'jpeg'}`;
+}
+
+async function getPostContent(uri: string): Promise<PostContent | null> {
   try {
     const [repo, collection, rkey] = uri.split("/").slice(-3);
     const response = await fetch(
@@ -72,20 +92,7 @@ function getLikesContainerParent(): HTMLElement | null {
   return tablist.parentElement?.parentElement as HTMLElement | null;
 }
 
-function hideNativeContent(container: HTMLElement): void {
-  // Children after the tab bar (index 2) are feed items; hide them all
-  const children = Array.from(container.children) as HTMLElement[];
-  for (let i = 3; i < children.length; i++) {
-    children[i].style.display = "none";
-  }
-}
 
-function showNativeContent(container: HTMLElement): void {
-  const children = Array.from(container.children) as HTMLElement[];
-  for (let i = 3; i < children.length; i++) {
-    children[i].style.display = "";
-  }
-}
 
 async function fetchAndRenderLikes(handle: string): Promise<void> {
   const container = getLikesContainerParent();
@@ -93,9 +100,6 @@ async function fetchAndRenderLikes(handle: string): Promise<void> {
 
   // Remove any existing likes container
   removeLikesContainer();
-
-  // Hide native content
-  hideNativeContent(container);
 
   // Create likes container
   const likesContainer = document.createElement("div");
@@ -118,6 +122,9 @@ async function fetchAndRenderLikes(handle: string): Promise<void> {
   const tabBar = container.children[2];
   tabBar.after(likesContainer);
   activeLikesContainer = likesContainer;
+
+  // Scroll the likes container into view
+  likesContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
   try {
     const did = await getDid(handle);
@@ -166,10 +173,41 @@ async function fetchAndRenderLikes(handle: string): Promise<void> {
         const handle = handles.get(author) || author;
         const postUrl = `https://bsky.app/profile/${handle}/post/${postId}`;
         const text = like.postContent?.text || "";
-        const hasImages = !!(
-          like.postContent?.embed?.images?.length ||
-          like.postContent?.embed?.media?.images?.length
-        );
+        const embedAny = like.postContent?.embed as any;
+        const isImages = embedAny?.$type === 'app.bsky.embed.images' || embedAny?.media?.$type === 'app.bsky.embed.images';
+        const isVideo = embedAny?.$type === 'app.bsky.embed.video' || embedAny?.media?.$type === 'app.bsky.embed.video';
+
+        let mediaHtml = '';
+        if (isImages) {
+          const imagesList = (embedAny?.images || embedAny?.media?.images || []) as { alt: string; image: BlobRef; aspectRatio?: { width: number; height: number } }[];
+          const thumbnails = imagesList.map((img: any, i: number) => {
+            const thumbUrl = getCdnUrl(author, img.image, 'feed_thumbnail');
+            const fullUrl = getCdnUrl(author, img.image, 'feed_fullsize');
+            const ratio = img.aspectRatio || { width: 1, height: 1 };
+            const aspectPercent = ((ratio.height / ratio.width) * 100).toFixed(2);
+            return `<div style="position:relative; width:100%; margin-bottom:4px; border-radius:12px; overflow:hidden;" onclick="event.stopPropagation(); window.open('${fullUrl}', '_blank')">
+              <div style="position:relative; width:100%; padding-bottom:${aspectPercent}%;">
+                <img src="${thumbUrl}" alt="${escapeHtml(img.alt || 'Image')}" loading="lazy" style="position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; border-radius:12px;" onerror="this.parentElement.parentElement.style.display='none'">
+              </div>
+            </div>`;
+          }).join('');
+          mediaHtml = `<div style="margin-top:8px; display:grid; grid-template-columns:${imagesList.length > 1 ? ' 1fr 1fr' : '1fr'}; gap:4px;">${thumbnails}</div>`;
+        } else if (isVideo) {
+          const videoBlob = embedAny?.video as BlobRef;
+          if (videoBlob) {
+            const videoUrl = getCdnUrl(author, videoBlob, 'feed_fullsize');
+            const posterUrl = getCdnUrl(author, videoBlob, 'feed_thumbnail');
+            const ratio = embedAny?.aspectRatio || { width: 16, height: 9 };
+            const aspectPercent = ((ratio.height / ratio.width) * 100).toFixed(2);
+            mediaHtml = `<div style="position:relative; width:100%; margin-top:8px; border-radius:12px; overflow:hidden;" onclick="event.stopPropagation();">
+              <div style="position:relative; width:100%; padding-bottom:${aspectPercent}%;">
+                <video poster="${posterUrl}" controls style="position:absolute; top:0; left:0; width:100%; height:100%; border-radius:12px;" onclick="event.stopPropagation();">
+                  <source src="${videoUrl}" type="${videoBlob.mimeType}">
+                </video>
+              </div>
+            </div>`;
+          }
+        }
         const createdAt = new Date(like.value.createdAt).toLocaleString();
 
         return `
@@ -218,9 +256,9 @@ async function fetchAndRenderLikes(handle: string): Promise<void> {
                   font-family: InterVariable, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
                   white-space: pre-wrap;
                   word-break: break-word;
-                  margin-bottom: ${hasImages ? "8px" : "0"};
+                  margin-bottom: ${(isImages || isVideo) ? "0" : "0"};
                 ">${escapeHtml(text) || "[no text]"}</div>
-                ${hasImages ? `<div style="color:rgb(139,148,164); font-size:13px;">[Post contains media]</div>` : ""}
+                ${mediaHtml}
                 <div style="display:flex; align-items:center; margin-top:12px; color:rgb(139,148,164); font-size:13px;">
                   <svg style="width:16px; height:16px; margin-right:4px; fill:rgb(200,57,97);" viewBox="0 0 24 24">
                     <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
@@ -260,12 +298,11 @@ function escapeHtml(text: string): string {
 }
 
 function removeLikesContainer(): void {
-  if (activeLikesContainer) {
-    activeLikesContainer.remove();
+  const container = activeLikesContainer || document.getElementById("bsky-likes-feed");
+  if (container) {
+    container.remove();
     activeLikesContainer = null;
   }
-  const existing = document.getElementById("bsky-likes-feed");
-  if (existing) existing.remove();
 }
 
 // ── Likes tab injection into profile pager ──────────────────────────────────
@@ -345,10 +382,6 @@ function createLikesTab(): HTMLElement {
     const handle = pathParts[1] === "profile" ? pathParts[2] : null;
     if (!handle) return;
 
-    // Restore native content (in case it was hidden)
-    const container = getLikesContainerParent();
-    if (container) showNativeContent(container);
-
     selectTab(tab);
     fetchAndRenderLikes(handle);
   });
@@ -395,13 +428,9 @@ function watchNativeTabs(): void {
     (tab as HTMLElement).dataset.bskyWatched = "1";
 
     tab.addEventListener("click", () => {
-      // When a native tab is clicked, remove likes container and show native content
+      // When a native tab is clicked, remove likes container
+      // React will handle showing the correct native content
       removeLikesContainer();
-      const container = getLikesContainerParent();
-      if (container) {
-        // Give React a tick to render, then ensure content is visible
-        setTimeout(() => showNativeContent(container), 100);
-      }
     });
   });
 }
