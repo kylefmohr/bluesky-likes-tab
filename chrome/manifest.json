@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "bluesky-likes-tab",
+  "version": "1.0.0",
+  "description": "Enable the \"Likes\" tab on other people's profiles!",
+  "content_scripts": [
+    {
+      "matches": ["https://bsky.app/*"],
+      "js": ["dist/content.js"]
+    }
+  ]
+}
