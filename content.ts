@@ -43,7 +43,7 @@ interface LikeRecord {
     };
     createdAt: string;
   };
-  postContent?: PostContent;
+  postContent?: PostContent | null;
 }
 
 // ── API helpers ──────────────────────────────────────────────────────────────
@@ -147,15 +147,269 @@ async function getProfiles(dids: string[]): Promise<Map<string, Profile>> {
 // ── Likes feed (tab content) ────────────────────────────────────────────────
 
 let activeLikesContainer: HTMLElement | null = null;
+let likesCursor: string | null = null;
+let likesObserver: IntersectionObserver | null = null;
+let currentLikesHandle: string | null = null;
 
 function getLikesContainerParent(): HTMLElement | null {
-  const tablist = document.querySelector('[data-testid="profilePager"]');
+  const tablist = getVisiblePager();
   if (!tablist) return null;
   // The container that holds profile header, tabs, AND content items
   return tablist.parentElement?.parentElement as HTMLElement | null;
 }
 
+// We store hidden children so we can restore them when user switches back to a native tab
+let hiddenNativeChildren: { el: HTMLElement; originalDisplay: string }[] = [];
 
+// Hide all native content after the tab bar so it doesn't show behind/below likes.
+// We hide rather than remove so React can properly reconcile when tabs change.
+function hideContentAfterTabBar(container: HTMLElement, tabBar: Element): void {
+  const tabBarIdx = Array.from(container.children).indexOf(tabBar);
+  hiddenNativeChildren = [];
+  for (let i = tabBarIdx + 1; i < container.children.length; i++) {
+    const child = container.children[i] as HTMLElement;
+    hiddenNativeChildren.push({ el: child, originalDisplay: child.style.display });
+    child.style.display = 'none';
+  }
+}
+
+// Restore hidden native content
+function restoreContentAfterTabBar(): void {
+  for (const { el, originalDisplay } of hiddenNativeChildren) {
+    el.style.display = originalDisplay;
+  }
+  hiddenNativeChildren = [];
+}
+
+// Build the HTML for a batch of like records
+function buildLikesHtml(likes: LikeRecord[], profiles: Map<string, Profile>): string {
+  return likes
+    .map((like) => {
+      const [, , author] = like.value.subject.uri.split("/");
+      const postId = like.value.subject.uri.split("/").pop();
+      const profile = profiles.get(author);
+      const authorHandle = profile?.handle || author;
+      const avatarUrl = profile?.avatarUrl;
+      const postUrl = `https://bsky.app/profile/${authorHandle}/post/${postId}`;
+      const text = like.postContent?.text || "";
+      const embedAny = like.postContent?.embed as any;
+      const isImages = embedAny?.$type === 'app.bsky.embed.images' || embedAny?.media?.$type === 'app.bsky.embed.images';
+      const isVideo = embedAny?.$type === 'app.bsky.embed.video' || embedAny?.media?.$type === 'app.bsky.embed.video';
+
+      // Avatar: show image if we have one, otherwise fall back to letter circle
+      const initial = authorHandle.charAt(0).toUpperCase();
+      const avatarHtml = avatarUrl
+        ? `<img src="${avatarUrl}" alt="${initial}" style="width:100%; height:100%; border-radius:50%; object-fit:cover;" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" loading="lazy"><div style="display:none; width:100%; height:100%; align-items:center; justify-content:center; color:rgb(171,184,201); font-size:14px; font-weight:600; position:absolute; top:0; left:0;">${initial}</div>`
+        : initial;
+
+      let mediaHtml = '';
+      if (isImages) {
+        const imagesList = (embedAny?.images || embedAny?.media?.images || []) as { alt: string; image: BlobRef; aspectRatio?: { width: number; height: number } }[];
+        const thumbnails = imagesList.map((img: any, i: number) => {
+          const thumbUrl = getCdnUrl(author, img.image, 'feed_thumbnail');
+          const fullUrl = getCdnUrl(author, img.image, 'feed_fullsize');
+          const ratio = img.aspectRatio || { width: 1, height: 1 };
+          const aspectPercent = ((ratio.height / ratio.width) * 100).toFixed(2);
+          return `<div style="position:relative; width:100%; margin-bottom:4px; border-radius:12px; overflow:hidden;" onclick="event.stopPropagation(); window.open('${fullUrl}', '_blank')">
+            <div style="position:relative; width:100%; padding-bottom:${aspectPercent}%;">
+              <img src="${thumbUrl}" alt="${escapeHtml(img.alt || 'Image')}" loading="lazy" style="position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; border-radius:12px;" onerror="this.parentElement.parentElement.style.display='none'">
+            </div>
+          </div>`;
+        }).join('');
+        mediaHtml = `<div style="margin-top:8px; display:grid; grid-template-columns:${imagesList.length > 1 ? ' 1fr 1fr' : '1fr'}; gap:4px;">${thumbnails}</div>`;
+      } else if (isVideo) {
+        const videoBlob = embedAny?.video as BlobRef;
+        if (videoBlob) {
+          const cid = videoBlob.ref.$link;
+          const playlistUrl = getVideoPlaylistUrl(author, cid);
+          const posterUrl = getVideoThumbnailUrl(author, cid);
+          const ratio = embedAny?.aspectRatio || { width: 16, height: 9 };
+          const aspectPercent = ((ratio.height / ratio.width) * 100).toFixed(2);
+          const videoId = `bsky-video-${postId}`;
+          mediaHtml = `<div style="position:relative; width:100%; margin-top:8px; border-radius:12px; overflow:hidden;" onclick="event.stopPropagation();">
+            <div style="position:relative; width:100%; padding-bottom:${aspectPercent}%;">
+              <video id="${videoId}" poster="${posterUrl}" controls playsinline style="position:absolute; top:0; left:0; width:100%; height:100%; border-radius:12px;" onclick="event.stopPropagation();" data-hls-url="${playlistUrl}"></video>
+            </div>
+          </div>`;
+        }
+      }
+      const createdAt = new Date(like.value.createdAt).toLocaleString();
+
+      return `
+        <div style="
+          box-sizing: border-box;
+          padding: 16px;
+          border-bottom: 1px solid rgb(46,55,67);
+          cursor: pointer;
+          transition: background-color 0.2s;
+        " onmouseover="this.style.backgroundColor='rgba(255,255,255,0.03)'" onmouseout="this.style.backgroundColor='transparent'" onclick="window.open('${postUrl.replace(/'/g, "\\'")}', '_blank')">
+          <div style="display:flex; align-items:flex-start; gap:12px;">
+            <div style="
+              width: 40px; height: 40px;
+              border-radius: 50%;
+              background: rgb(46,55,67);
+              flex-shrink: 0;
+              position: relative;
+              overflow: hidden;
+            ">
+              ${avatarHtml}
+            </div>
+            <div style="flex:1; min-width:0;">
+              <div style="display:flex; align-items:baseline; gap:4px; margin-bottom:4px;">
+                <span style="
+                  color: rgb(247,247,247);
+                  font-weight: 600;
+                  font-size: 15px;
+                  font-family: InterVariable, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                ">@${authorHandle}</span>
+                <span style="
+                  color: rgb(139,148,164);
+                  font-size: 13px;
+                  font-family: InterVariable, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                  flex-shrink: 0;
+                ">· ${createdAt}</span>
+              </div>
+              <div style="
+                color: rgb(247,247,247);
+                font-size: 15px;
+                line-height: 20px;
+                font-family: InterVariable, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                white-space: pre-wrap;
+                word-break: break-word;
+                margin-bottom: ${(isImages || isVideo) ? "0" : "0"};
+              ">${escapeHtml(text) || "[no text]"}</div>
+              ${mediaHtml}
+              <div style="display:flex; align-items:center; margin-top:12px; color:rgb(139,148,164); font-size:13px;">
+                <svg style="width:16px; height:16px; margin-right:4px; fill:rgb(200,57,97);" viewBox="0 0 24 24">
+                  <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+                </svg>
+                Liked
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+// Set up infinite scroll for the likes feed
+function setupLikesInfiniteScroll(container: HTMLElement, handle: string): void {
+  // Clean up previous observer
+  if (likesObserver) {
+    likesObserver.disconnect();
+    likesObserver = null;
+  }
+
+  // Create a sentinel element at the bottom of the likes feed
+  const sentinel = document.createElement("div");
+  sentinel.id = "bsky-likes-sentinel";
+  sentinel.style.cssText = "height: 1px; width: 100%;";
+  container.appendChild(sentinel);
+
+  likesObserver = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting && likesCursor) {
+          loadMoreLikes(handle, container);
+        }
+      }
+    },
+    { rootMargin: "200px" }
+  );
+  likesObserver.observe(sentinel);
+}
+
+// Load more liked posts using the stored cursor
+async function loadMoreLikes(handle: string, container: HTMLElement): Promise<void> {
+  if (!likesCursor) return;
+
+  // Disconnect observer while loading to prevent duplicate loads
+  if (likesObserver) {
+    likesObserver.disconnect();
+    likesObserver = null;
+  }
+
+  // Remove old sentinel
+  const oldSentinel = container.querySelector("#bsky-likes-sentinel");
+  if (oldSentinel) oldSentinel.remove();
+
+  // Add loading indicator at bottom
+  const loadingDiv = document.createElement("div");
+  loadingDiv.id = "bsky-likes-loading-more";
+  loadingDiv.innerHTML = `
+    <div style="text-align:center; padding:20px 20px; color:rgb(171,184,201); font-size:14px; font-family:InterVariable,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+      <div style="display:inline-block; width:20px; height:20px; border:2px solid rgb(60,65,73); border-top-color:rgb(15,115,255); border-radius:50%; animation:bsky-likes-spin 0.6s linear infinite; vertical-align:middle; margin-right:8px;"></div>
+      Loading more likes…
+    </div>
+  `;
+  container.appendChild(loadingDiv);
+
+  try {
+    const did = await getDid(handle);
+    const response = await fetch(
+      `https://bsky.social/xrpc/com.atproto.repo.listRecords?repo=${did}&collection=app.bsky.feed.like&limit=50&cursor=${encodeURIComponent(likesCursor)}`
+    );
+    if (!response.ok) throw new Error(`Server responded with ${response.status}`);
+
+    const data = await response.json();
+    const rawLikes: LikeRecord[] = data.records || [];
+    likesCursor = data.cursor || null;
+
+    if (rawLikes.length === 0) {
+      loadingDiv.innerHTML = `
+        <div style="text-align:center; padding:20px 20px; color:rgb(171,184,201); font-size:14px; font-family:InterVariable,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+          No more likes
+        </div>
+      `;
+      return;
+    }
+
+    // Fetch post content for each liked post
+    const likes = await Promise.all(
+      rawLikes.map(async (like) => ({
+        ...like,
+        postContent: await getPostContent(like.value.subject.uri),
+      }))
+    );
+
+    // Collect unique author DIDs and batch-fetch their profiles
+    const authorDids = [...new Set(likes.map((like) => {
+      const [, , author] = like.value.subject.uri.split("/");
+      return author;
+    }))];
+    const profiles = await getProfiles(authorDids);
+
+    // Build and append new feed items
+    const feedHtml = buildLikesHtml(likes, profiles);
+    loadingDiv.insertAdjacentHTML("beforebegin", feedHtml);
+    loadingDiv.remove();
+
+    // Initialize video players for newly added content
+    initVideoPlayers(container);
+
+    // Re-setup infinite scroll if there are more pages
+    if (likesCursor) {
+      setupLikesInfiniteScroll(container, handle);
+    } else {
+      // No more pages - show end message
+      const endDiv = document.createElement("div");
+      endDiv.innerHTML = `
+        <div style="text-align:center; padding:20px 20px; color:rgb(171,184,201); font-size:14px; font-family:InterVariable,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+          End of likes
+        </div>
+      `;
+      container.appendChild(endDiv);
+    }
+  } catch (error) {
+    loadingDiv.innerHTML = `
+      <div style="text-align:center; padding:20px 20px; color:rgb(200,57,97); font-size:14px; font-family:InterVariable,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+        Error loading more likes: ${escapeHtml((error as Error).message)}
+      </div>
+    `;
+  }
+}
 
 async function fetchAndRenderLikes(handle: string): Promise<void> {
   const container = getLikesContainerParent();
@@ -181,10 +435,21 @@ async function fetchAndRenderLikes(handle: string): Promise<void> {
     </style>
   `;
 
-  // Insert after the tab bar (index 2)
-  const tabBar = container.children[2];
-  tabBar.after(likesContainer);
+  // Find the tab bar element and clear all content after it
+  const tablist = getVisiblePager();
+  const tabBar = tablist?.parentElement;
+  if (tabBar) {
+    hideContentAfterTabBar(container, tabBar);
+  }
+
+  // Insert likes container after the tab bar
+  if (tabBar) {
+    tabBar.after(likesContainer);
+  } else {
+    container.appendChild(likesContainer);
+  }
   activeLikesContainer = likesContainer;
+  currentLikesHandle = handle;
 
   // Scroll the likes container into view
   likesContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -198,6 +463,7 @@ async function fetchAndRenderLikes(handle: string): Promise<void> {
 
     const data = await response.json();
     const rawLikes: LikeRecord[] = data.records || [];
+    likesCursor = data.cursor || null;
 
     if (rawLikes.length === 0) {
       likesContainer.innerHTML = `
@@ -224,116 +490,7 @@ async function fetchAndRenderLikes(handle: string): Promise<void> {
     const profiles = await getProfiles(authorDids);
 
     // Build feed items
-    const feedHtml = likes
-      .map((like) => {
-        const [, , author] = like.value.subject.uri.split("/");
-        const postId = like.value.subject.uri.split("/").pop();
-        const profile = profiles.get(author);
-        const authorHandle = profile?.handle || author;
-        const avatarUrl = profile?.avatarUrl;
-        const postUrl = `https://bsky.app/profile/${authorHandle}/post/${postId}`;
-        const text = like.postContent?.text || "";
-        const embedAny = like.postContent?.embed as any;
-        const isImages = embedAny?.$type === 'app.bsky.embed.images' || embedAny?.media?.$type === 'app.bsky.embed.images';
-        const isVideo = embedAny?.$type === 'app.bsky.embed.video' || embedAny?.media?.$type === 'app.bsky.embed.video';
-
-        // Avatar: show image if we have one, otherwise fall back to letter circle
-        const initial = authorHandle.charAt(0).toUpperCase();
-        const avatarHtml = avatarUrl
-          ? `<img src="${avatarUrl}" alt="${initial}" style="width:100%; height:100%; border-radius:50%; object-fit:cover;" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" loading="lazy"><div style="display:none; width:100%; height:100%; align-items:center; justify-content:center; color:rgb(171,184,201); font-size:14px; font-weight:600; position:absolute; top:0; left:0;">${initial}</div>`
-          : initial;
-
-        let mediaHtml = '';
-        if (isImages) {
-          const imagesList = (embedAny?.images || embedAny?.media?.images || []) as { alt: string; image: BlobRef; aspectRatio?: { width: number; height: number } }[];
-          const thumbnails = imagesList.map((img: any, i: number) => {
-            const thumbUrl = getCdnUrl(author, img.image, 'feed_thumbnail');
-            const fullUrl = getCdnUrl(author, img.image, 'feed_fullsize');
-            const ratio = img.aspectRatio || { width: 1, height: 1 };
-            const aspectPercent = ((ratio.height / ratio.width) * 100).toFixed(2);
-            return `<div style="position:relative; width:100%; margin-bottom:4px; border-radius:12px; overflow:hidden;" onclick="event.stopPropagation(); window.open('${fullUrl}', '_blank')">
-              <div style="position:relative; width:100%; padding-bottom:${aspectPercent}%;">
-                <img src="${thumbUrl}" alt="${escapeHtml(img.alt || 'Image')}" loading="lazy" style="position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; border-radius:12px;" onerror="this.parentElement.parentElement.style.display='none'">
-              </div>
-            </div>`;
-          }).join('');
-          mediaHtml = `<div style="margin-top:8px; display:grid; grid-template-columns:${imagesList.length > 1 ? ' 1fr 1fr' : '1fr'}; gap:4px;">${thumbnails}</div>`;
-        } else if (isVideo) {
-          const videoBlob = embedAny?.video as BlobRef;
-          if (videoBlob) {
-            const cid = videoBlob.ref.$link;
-            const playlistUrl = getVideoPlaylistUrl(author, cid);
-            const posterUrl = getVideoThumbnailUrl(author, cid);
-            const ratio = embedAny?.aspectRatio || { width: 16, height: 9 };
-            const aspectPercent = ((ratio.height / ratio.width) * 100).toFixed(2);
-            // Use a unique ID so we can target the video element for HLS init
-            const videoId = `bsky-video-${postId}`;
-            mediaHtml = `<div style="position:relative; width:100%; margin-top:8px; border-radius:12px; overflow:hidden;" onclick="event.stopPropagation();">
-              <div style="position:relative; width:100%; padding-bottom:${aspectPercent}%;">
-                <video id="${videoId}" poster="${posterUrl}" controls playsinline style="position:absolute; top:0; left:0; width:100%; height:100%; border-radius:12px;" onclick="event.stopPropagation();" data-hls-url="${playlistUrl}"></video>
-              </div>
-            </div>`;
-          }
-        }
-        const createdAt = new Date(like.value.createdAt).toLocaleString();
-
-        return `
-          <div style="
-            box-sizing: border-box;
-            padding: 16px;
-            border-bottom: 1px solid rgb(46,55,67);
-            cursor: pointer;
-            transition: background-color 0.2s;
-          " onmouseover="this.style.backgroundColor='rgba(255,255,255,0.03)'" onmouseout="this.style.backgroundColor='transparent'" onclick="window.open('${postUrl.replace(/'/g, "\\'")}', '_blank')">
-            <div style="display:flex; align-items:flex-start; gap:12px;">
-              <div style="
-                width: 40px; height: 40px;
-                border-radius: 50%;
-                background: rgb(46,55,67);
-                flex-shrink: 0;
-                position: relative;
-                overflow: hidden;
-              ">
-                ${avatarHtml}
-              </div>
-              <div style="flex:1; min-width:0;">
-                <div style="display:flex; align-items:baseline; gap:4px; margin-bottom:4px;">
-                  <span style="
-                    color: rgb(247,247,247);
-                    font-weight: 600;
-                    font-size: 15px;
-                    font-family: InterVariable, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-                  ">@${authorHandle}</span>
-                  <span style="
-                    color: rgb(139,148,164);
-                    font-size: 13px;
-                    font-family: InterVariable, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                    flex-shrink: 0;
-                  ">· ${createdAt}</span>
-                </div>
-                <div style="
-                  color: rgb(247,247,247);
-                  font-size: 15px;
-                  line-height: 20px;
-                  font-family: InterVariable, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                  white-space: pre-wrap;
-                  word-break: break-word;
-                  margin-bottom: ${(isImages || isVideo) ? "0" : "0"};
-                ">${escapeHtml(text) || "[no text]"}</div>
-                ${mediaHtml}
-                <div style="display:flex; align-items:center; margin-top:12px; color:rgb(139,148,164); font-size:13px;">
-                  <svg style="width:16px; height:16px; margin-right:4px; fill:rgb(200,57,97);" viewBox="0 0 24 24">
-                    <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
-                  </svg>
-                  Liked
-                </div>
-              </div>
-            </div>
-          </div>
-        `;
-      })
-      .join("");
+    const feedHtml = buildLikesHtml(likes, profiles);
 
     likesContainer.innerHTML = `
       <div style="
@@ -348,6 +505,11 @@ async function fetchAndRenderLikes(handle: string): Promise<void> {
 
     // Initialize HLS for all video elements after they're in the DOM
     initVideoPlayers(likesContainer);
+
+    // Set up infinite scroll if there are more pages
+    if (likesCursor) {
+      setupLikesInfiniteScroll(likesContainer, handle);
+    }
   } catch (error) {
     likesContainer.innerHTML = `
       <div style="text-align:center; padding:40px 20px; color:rgb(200,57,97); font-size:15px; font-family:InterVariable,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
@@ -364,11 +526,24 @@ function escapeHtml(text: string): string {
 }
 
 function removeLikesContainer(): void {
+  // Disconnect infinite scroll observer
+  if (likesObserver) {
+    likesObserver.disconnect();
+    likesObserver = null;
+  }
+
   const container = activeLikesContainer || document.getElementById("bsky-likes-feed");
   if (container) {
     container.remove();
     activeLikesContainer = null;
   }
+
+  // Restore hidden native content so React can reconcile when tab changes
+  restoreContentAfterTabBar();
+
+  // Reset state
+  likesCursor = null;
+  currentLikesHandle = null;
 }
 
 // Initialize HLS.js on all video elements that have a data-hls-url attribute
@@ -403,9 +578,8 @@ async function initVideoPlayers(container: HTMLElement): Promise<void> {
 
 let likesTabInjected = false;
 
-function selectTab(tab: HTMLElement): void {
-  // Deselect all tabs
-  const tablist = document.querySelector('[data-testid="profilePager"]');
+function deselectAllTabs(): void {
+  const tablist = getVisiblePager();
   if (!tablist) return;
   const allTabs = tablist.querySelectorAll('[role="tab"]');
   allTabs.forEach((t) => {
@@ -419,6 +593,27 @@ function selectTab(tab: HTMLElement): void {
     if (underline) underline.remove();
     t.setAttribute("aria-selected", "false");
   });
+}
+
+function deselectLikesTab(): void {
+  const likesLabel = document.querySelector('[data-testid="profilePager-Likes"]');
+  if (!likesLabel) return;
+  const likesTab = likesLabel.closest('[role="tab"]') as HTMLElement | null;
+  if (!likesTab) return;
+
+  // Reset label styling
+  (likesLabel as HTMLElement).style.color = "rgb(171, 184, 201)";
+  (likesLabel as HTMLElement).style.fontWeight = "600";
+
+  // Remove blue underline
+  const underline = likesTab.querySelector('[style*="background-color: rgb(15, 115, 255)"]');
+  if (underline) underline.remove();
+
+  likesTab.setAttribute("aria-selected", "false");
+}
+
+function selectTab(tab: HTMLElement): void {
+  deselectAllTabs();
 
   // Select this tab
   const label = tab.querySelector('[dir="auto"]') as HTMLElement;
@@ -491,29 +686,9 @@ function createLikesTab(): HTMLElement {
   return tab;
 }
 
-function injectLikesTab(): void {
-  if (likesTabInjected) return;
-
-  const tablist = document.querySelector('[data-testid="profilePager"]');
-  if (!tablist) return;
-
-  // Check if Likes tab already exists
-  if (tablist.querySelector('[data-testid="profilePager-Likes"]')) {
-    likesTabInjected = true;
-    return;
-  }
-
-  const selectorDiv = tablist.querySelector('[data-testid="profilePager-selector"]');
-  if (!selectorDiv) return;
-
-  const likesTab = createLikesTab();
-  selectorDiv.appendChild(likesTab);
-  likesTabInjected = true;
-}
-
 // Watch for native tab clicks to restore native content
 function watchNativeTabs(): void {
-  const tablist = document.querySelector('[data-testid="profilePager"]');
+  const tablist = getVisiblePager();
   if (!tablist) return;
 
   const nativeTabs = tablist.querySelectorAll('[role="tab"]:not([data-testid="profilePager-selector-4"])');
@@ -522,8 +697,8 @@ function watchNativeTabs(): void {
     (tab as HTMLElement).dataset.bskyWatched = "1";
 
     tab.addEventListener("click", () => {
-      // When a native tab is clicked, remove likes container
-      // React will handle showing the correct native content
+      // When a native tab is clicked, remove likes container and deselect Likes tab
+      deselectLikesTab();
       removeLikesContainer();
     });
   });
@@ -648,25 +823,90 @@ const menuObserver = new MutationObserver((mutations) => {
 // Observer for profile page changes (tablist appearing, URL changes)
 const profileObserver = new MutationObserver(() => {
   // Reset injection flag if tablist isn't on the page anymore
-  const tablist = document.querySelector('[data-testid="profilePager"]');
+  const tablist = getVisiblePager();
   if (!tablist) {
     likesTabInjected = false;
     removeLikesContainer();
     return;
   }
 
-  // Check if Likes tab still exists (React may have re-rendered and removed it)
+  // Check if Likes tab still exists in the visible tab bar (React may have re-rendered and removed it)
   if (!tablist.querySelector('[data-testid="profilePager-Likes"]')) {
     likesTabInjected = false;
   }
 
-  if (!likesTabInjected) {
-    injectLikesTab();
-  }
+  attemptInjection();
 
   // Watch native tabs
   watchNativeTabs();
 });
+
+// ── Reliable injection via polling ──────────────────────────────────────────
+
+let lastProfilePath = '';
+let pollInterval: ReturnType<typeof setInterval> | null = null;
+
+/** Find the visible profilePager (there can be hidden ghost elements from React) */
+function getVisiblePager(): HTMLElement | null {
+  const pagers = document.querySelectorAll('[data-testid="profilePager"]');
+  for (const pager of pagers) {
+    const rect = pager.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return pager as HTMLElement;
+  }
+  return null;
+}
+
+function attemptInjection(): void {
+  // Verify the flag matches reality — React may have removed our tab
+  // even when navigating to the same profile URL
+  const tablist = getVisiblePager();
+  if (!tablist) {
+    likesTabInjected = false;
+    return;
+  }
+
+  if (!tablist.querySelector('[data-testid="profilePager-Likes"]')) {
+    likesTabInjected = false;
+  }
+
+  if (likesTabInjected) return;
+
+  // Need selectorDiv to append our tab
+  const selectorDiv = tablist.querySelector('[data-testid="profilePager-selector"]');
+  if (!selectorDiv) return;
+
+  // Create and append
+  const likesTab = createLikesTab();
+  selectorDiv.appendChild(likesTab);
+  likesTabInjected = true;
+}
+
+function startPolling(): void {
+  if (pollInterval !== null) return;
+  pollInterval = setInterval(() => {
+    const path = window.location.pathname;
+
+    // Detect navigation to a different profile (or leaving profile pages)
+    if (path !== lastProfilePath) {
+      const wasOnProfile = lastProfilePath.startsWith('/profile/');
+      const isOnProfile = path.startsWith('/profile/');
+
+      lastProfilePath = path;
+
+      if (wasOnProfile) {
+        // Leaving or switching profiles — clean up
+        likesTabInjected = false;
+        removeLikesContainer();
+      }
+    }
+
+    // If on a profile page, try to inject
+    if (path.startsWith('/profile/')) {
+      attemptInjection();
+      watchNativeTabs();
+    }
+  }, 500);
+}
 
 // ── Initialization ──────────────────────────────────────────────────────────
 
@@ -676,16 +916,15 @@ function init(): void {
     subtree: true,
   });
 
+  // MutationObserver still catches React re-renders that remove our tab
   profileObserver.observe(document, {
     childList: true,
     subtree: true,
   });
 
-  // Initial injection if already on a profile page
-  if (document.querySelector('[data-testid="profilePager"]')) {
-    injectLikesTab();
-    watchNativeTabs();
-  }
+  // Start the reliable polling loop
+  lastProfilePath = window.location.pathname;
+  startPolling();
 }
 
 // Run on load
