@@ -45,4 +45,4 @@ Any updates to this policy will be reflected in this document and published alon
 
 ## Contact
 
-For questions about this privacy policy, open an issue on the [GitHub repository](https://github.com/YOUR_USERNAME/bluesky-likes-tab).
+For questions about this privacy policy, open an issue on the [GitHub repository](https://github.com/kylefmohr/bluesky-likes-tab).
